@@ -58,34 +58,6 @@ Example:
 objector -url http://localhost:8000/test.html -timeout 30s
 ```
 
-## Configuration
-
-The tool uses `patterns.json` for configuring detection patterns. You can modify this file to add or remove patterns:
-
-```json
-{
-  "patterns": [
-    {
-      "name": "AWS Access Key",
-      "pattern": "\\b(AKIA|ASIA)[A-Z0-9]{16}\\b",
-      "description": "AWS Access Key ID"
-    },
-    // Add more patterns here
-  ],
-  "ignoredPaths": [
-    "performance",
-    "localStorage",
-    "sessionStorage",
-    "indexedDB",
-    "webkitStorageInfo",
-    "chrome",
-    "document",
-    "history"
-  ],
-  "maxDepth": 5
-}
-```
-
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
