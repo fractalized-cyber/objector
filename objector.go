@@ -7,10 +7,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"os"
 	"strings"
 	"time"
-	"os"
 
+	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 )
 
@@ -49,13 +50,17 @@ type ObjectMonitor struct {
 	maxDepth     int
 	foundMatches map[string]bool
 	debug        bool
+	stats        struct {
+		objectsScanned int
+		matchesFound   int
+	}
 }
 
 // NewObjectMonitor creates a new ObjectMonitor instance
 func NewObjectMonitor() *ObjectMonitor {
 	// Initialize with hardcoded patterns
 	patterns := make(map[string]struct{ pattern, description string })
-	
+
 	// Add default patterns
 	patterns["AWS Access Key"] = struct{ pattern, description string }{
 		pattern:     `\b(AKIA|ASIA)[A-Z0-9]{16}\b`,
@@ -80,14 +85,14 @@ func NewObjectMonitor() *ObjectMonitor {
 
 	// Default ignored paths
 	ignoredPaths := map[string]bool{
-		"performance":      true,
-		"localStorage":     true,
-		"sessionStorage":   true,
-		"indexedDB":        true,
+		"performance":       true,
+		"localStorage":      true,
+		"sessionStorage":    true,
+		"indexedDB":         true,
 		"webkitStorageInfo": true,
-		"chrome":          true,
-		"document":        true,
-		"history":         true,
+		"chrome":            true,
+		"document":          true,
+		"history":           true,
 	}
 
 	return &ObjectMonitor{
@@ -132,6 +137,10 @@ func (m *ObjectMonitor) GetMonitoringScript() string {
 				this.foundMatches = new Set();
 				this.debug = false;
 				this.scanInterval = null;
+				this.stats = {
+					objectsScanned: 0,
+					matchesFound: 0
+				};
 			}
 
 			addPattern(name, pattern, description = '') {
@@ -326,6 +335,7 @@ func (m *ObjectMonitor) GetMonitoringScript() string {
 				if (this.ignoredPaths.has(path)) return;
 
 				visited.add(obj);
+				this.stats.objectsScanned++;
 
 				try {
 					for (const prop in obj) {
@@ -341,6 +351,10 @@ func (m *ObjectMonitor) GetMonitoringScript() string {
 						} catch (e) {}
 					}
 				} catch (e) {}
+			}
+
+			getStats() {
+				return this.stats;
 			}
 		}
 
@@ -385,7 +399,7 @@ func wrapText(text string, width int) []string {
 	var lines []string
 	// Split by newlines first
 	paragraphs := strings.Split(text, "\n")
-	
+
 	for _, paragraph := range paragraphs {
 		// Then wrap each paragraph
 		for len(paragraph) > 0 {
@@ -467,21 +481,111 @@ func printTableRow(w *os.File, pattern, path, value, description string) {
 
 	// Print bottom border for the last row
 	if maxLines > 0 {
-		fmt.Println("├" + strings.Repeat("─", patternWidth+2) + "┼" + 
-			strings.Repeat("─", pathWidth+2) + "┼" + 
-			strings.Repeat("─", valueWidth+2) + "┼" + 
-			strings.Repeat("─", descWidth+2) + "┤")
+		fmt.Println("└" + strings.Repeat("─", patternWidth+2) + "┴" +
+			strings.Repeat("─", pathWidth+2) + "┴" +
+			strings.Repeat("─", valueWidth+2) + "┴" +
+			strings.Repeat("─", descWidth+2) + "┘")
 	}
+}
+
+func printUsage() {
+	fmt.Println(`
+OBJECTOR - JavaScript Object Monitor
+
+  A powerful tool for monitoring JavaScript objects and detecting exposed
+  credentials, API keys, and sensitive data in web applications.
+
+  USAGE:
+    objector -u <URL> [OPTIONS]
+
+  REQUIRED ARGUMENTS:
+    -u, --url <URL>              Target URL to monitor
+
+  OPTIONAL ARGUMENTS:
+    --timeout <duration>         Monitoring timeout (default: 20s)
+    --headers <headers>          Custom headers for requests
+    --string <custom_string>     Custom string to search for
+    --help, -h                   Show this help message
+
+  EXAMPLES:
+    objector -u [url]
+    objector -u [url] --timeout 30s
+    objector -u [url] --headers "Authorization: Bearer token"
+    objector -u [url] --string "my-secret-key"
+
+  DETECTED PATTERNS:
+    • AWS Access Keys (AKIA/ASIA format)
+    • AWS Secret Keys (40-character base64)
+    • Private Keys (RSA, DSA, EC, OpenSSH)
+    • JWT Tokens (eyJ format)
+    • Generic API Keys (32+ characters)
+`)
 }
 
 func main() {
 	// Parse command line flags
-	url := flag.String("url", "", "URL to monitor")
+	url := flag.String("u", "", "URL to monitor (required)")
+	urlLong := flag.String("url", "", "URL to monitor (required)")
 	timeout := flag.Duration("timeout", 20*time.Second, "Monitoring timeout")
+	headers := flag.String("headers", "", "Headers to include in requests (format: 'HEADER: VALUE,HEADER2: VALUE2')")
+	customString := flag.String("string", "", "Custom string to search for (if provided, ignores default patterns)")
+	help := flag.Bool("help", false, "Show help message")
+	helpShort := flag.Bool("h", false, "Show help message")
+
+	// Custom usage function
+	flag.Usage = printUsage
+
 	flag.Parse()
 
-	if *url == "" {
-		log.Fatal("Please provide a URL to monitor using the -url flag")
+	// Check if help is requested
+	if *help || *helpShort {
+		printUsage()
+		os.Exit(0)
+	}
+
+	// Check if no arguments provided
+	if len(os.Args) == 1 {
+		printUsage()
+		os.Exit(1)
+	}
+
+	// Use either -u or --url
+	targetURL := *url
+	if targetURL == "" {
+		targetURL = *urlLong
+	}
+
+	if targetURL == "" {
+		fmt.Println("\033[31mError: URL is required. Use -u or --url to specify the target URL.\033[0m")
+		fmt.Println("Run 'objector --help' for usage information.")
+		os.Exit(1)
+	}
+
+	// Animation frames for the spinner
+	spinnerFrames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	spinnerIndex := 0
+
+	// Function to print the spinner
+	printSpinner := func() {
+		fmt.Printf("\r\033[K%s Scanning for secrets...", spinnerFrames[spinnerIndex])
+		spinnerIndex = (spinnerIndex + 1) % len(spinnerFrames)
+	}
+
+	// Clear the spinner line
+	clearSpinner := func() {
+		fmt.Print("\r\033[K")
+	}
+
+	// Parse headers
+	headerMap := make(map[string]string)
+	if *headers != "" {
+		headerPairs := strings.Split(*headers, ",")
+		for _, pair := range headerPairs {
+			parts := strings.SplitN(strings.TrimSpace(pair), ":", 2)
+			if len(parts) == 2 {
+				headerMap[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+			}
+		}
 	}
 
 	// Create a new context with options to suppress errors
@@ -520,9 +624,9 @@ func main() {
 	)
 
 	// Print top border
-	fmt.Println("┌" + strings.Repeat("─", patternWidth+2) + "┬" + 
-		strings.Repeat("─", pathWidth+2) + "┬" + 
-		strings.Repeat("─", valueWidth+2) + "┬" + 
+	fmt.Println("┌" + strings.Repeat("─", patternWidth+2) + "┬" +
+		strings.Repeat("─", pathWidth+2) + "┬" +
+		strings.Repeat("─", valueWidth+2) + "┬" +
 		strings.Repeat("─", descWidth+2) + "┐")
 
 	// Print header
@@ -533,15 +637,24 @@ func main() {
 		descWidth, "Description")
 
 	// Print header separator
-	fmt.Println("├" + strings.Repeat("─", patternWidth+2) + "┼" + 
-		strings.Repeat("─", pathWidth+2) + "┼" + 
-		strings.Repeat("─", valueWidth+2) + "┼" + 
+	fmt.Println("├" + strings.Repeat("─", patternWidth+2) + "┼" +
+		strings.Repeat("─", pathWidth+2) + "┼" +
+		strings.Repeat("─", valueWidth+2) + "┼" +
 		strings.Repeat("─", descWidth+2) + "┤")
 
 	// Run the browser
 	err := chromedp.Run(ctx,
+		// Set headers for all requests
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			headers := make(map[string]interface{})
+			for k, v := range headerMap {
+				headers[k] = v
+			}
+			return network.SetExtraHTTPHeaders(network.Headers(headers)).Do(ctx)
+		}),
+
 		// Navigate to the target page
-		chromedp.Navigate(*url),
+		chromedp.Navigate(targetURL),
 
 		// Wait for the page to be fully loaded
 		chromedp.WaitReady("body", chromedp.ByQuery),
@@ -549,61 +662,97 @@ func main() {
 		// Inject our monitoring script
 		chromedp.Evaluate(monitor.GetMonitoringScript(), nil),
 
+		// Set custom search string if provided
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			if *customString != "" {
+				return chromedp.Evaluate(fmt.Sprintf(`window.__customSearchString = "%s";`, *customString), nil).Do(ctx)
+			}
+			return nil
+		}),
+
 		// Check for credentials multiple times
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			// Now do our credential scan
 			var result string
+			var finalStats struct {
+				ObjectsScanned int `json:"objectsScanned"`
+				MatchesFound   int `json:"matchesFound"`
+			}
+
 			err := chromedp.Evaluate(`
 				(function() {
 					try {
 						let matches = [];
 						let visited = new Set();
+						let stats = {
+							objectsScanned: 0,
+							matchesFound: 0
+						};
 						
 						function checkValue(value, path) {
 							if (typeof value !== 'string') return;
 							
-							// Check for AWS Access Key
-							if (value.match(/AKIA[A-Z0-9]{16}/)) {
+							// Check for custom string if provided
+							if (window.__customSearchString && value.includes(window.__customSearchString)) {
+								stats.matchesFound++;
 								matches.push({
-									pattern: 'AWS Access Key',
+									pattern: 'Custom String',
 									path: path,
 									value: value,
-									description: 'AWS Access Key ID'
+									description: 'Custom String Match'
 								});
 								return;
 							}
 							
-							// Check for AWS Secret Key
-							if (value.match(/secret[a-zA-Z0-9]{40}/)) {
-								matches.push({
-									pattern: 'AWS Secret Key',
-									path: path,
-									value: value,
-									description: 'AWS Secret Access Key'
-								});
-								return;
-							}
-							
-							// Check for Private Key
-							if (value.match(/-----BEGIN (?:RSA|OPENSSH|DSA|EC|PGP) PRIVATE KEY-----/)) {
-								matches.push({
-									pattern: 'Private Key',
-									path: path,
-									value: value,
-									description: 'Private Key Header'
-								});
-								return;
-							}
-							
-							// Check for JWT Token
-							if (value.match(/eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*$/)) {
-								matches.push({
-									pattern: 'JWT Token',
-									path: path,
-									value: value,
-									description: 'JWT Token'
-								});
-								return;
+							// Only check default patterns if no custom string is provided
+							if (!window.__customSearchString) {
+								// Check for AWS Access Key
+								if (value.match(/AKIA[A-Z0-9]{16}/)) {
+									stats.matchesFound++;
+									matches.push({
+										pattern: 'AWS Access Key',
+										path: path,
+										value: value,
+										description: 'AWS Access Key ID'
+									});
+									return;
+								}
+								
+								// Check for AWS Secret Key
+								if (value.match(/secret[a-zA-Z0-9]{40}/)) {
+									stats.matchesFound++;
+									matches.push({
+										pattern: 'AWS Secret Key',
+										path: path,
+										value: value,
+										description: 'AWS Secret Access Key'
+									});
+									return;
+								}
+								
+								// Check for Private Key
+								if (value.match(/-----BEGIN (?:RSA|OPENSSH|DSA|EC|PGP) PRIVATE KEY-----/)) {
+									stats.matchesFound++;
+									matches.push({
+										pattern: 'Private Key',
+										path: path,
+										value: value,
+										description: 'Private Key Header'
+									});
+									return;
+								}
+								
+								// Check for JWT Token
+								if (value.match(/eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*$/)) {
+									stats.matchesFound++;
+									matches.push({
+										pattern: 'JWT Token',
+										path: path,
+										value: value,
+										description: 'JWT Token'
+									});
+									return;
+								}
 							}
 						}
 						
@@ -616,6 +765,7 @@ func main() {
 							if (ignoredPaths.includes(path.split('.').pop())) return;
 							
 							visited.add(obj);
+							stats.objectsScanned++;
 							
 							try {
 								for (const prop in obj) {
@@ -643,31 +793,40 @@ func main() {
 						// Start scanning from global object
 						scanObject(globalObject);
 						
-						return JSON.stringify(matches);
+						return JSON.stringify({
+							matches: matches,
+							stats: stats
+						});
 					} catch (e) {
 						return JSON.stringify({ error: e.message });
 					}
 				})()
 			`, &result).Do(ctx)
-			
+
 			if err != nil {
 				return nil
 			}
-			
+
 			// Parse and format the matches
-			var matches []struct {
-				Pattern     string `json:"pattern"`
-				Path        string `json:"path"`
-				Value       string `json:"value"`
-				Description string `json:"description"`
+			var response struct {
+				Matches []struct {
+					Pattern     string `json:"pattern"`
+					Path        string `json:"path"`
+					Value       string `json:"value"`
+					Description string `json:"description"`
+				} `json:"matches"`
+				Stats struct {
+					ObjectsScanned int `json:"objectsScanned"`
+					MatchesFound   int `json:"matchesFound"`
+				} `json:"stats"`
 			}
-			
-			if err := json.Unmarshal([]byte(result), &matches); err != nil {
+
+			if err := json.Unmarshal([]byte(result), &response); err != nil {
 				return nil
 			}
-			
+
 			// Print only new matches
-			for _, match := range matches {
+			for _, match := range response.Matches {
 				// Create a unique key for this secret
 				secretKey := match.Path + ":" + match.Value
 				if !seenSecrets[secretKey] {
@@ -680,20 +839,31 @@ func main() {
 			ticker := time.NewTicker(1 * time.Second)
 			defer ticker.Stop()
 
+			// Print initial spinner
+			printSpinner()
+
 			for {
 				select {
 				case <-ticker.C:
+					// Update spinner
+					printSpinner()
+
 					// Re-run the scan
 					err = chromedp.Evaluate(`
 						(function() {
 							try {
 								let matches = [];
 								let visited = new Set();
+								let stats = {
+									objectsScanned: 0,
+									matchesFound: 0
+								};
 								
 								function checkValue(value, path) {
 									if (typeof value !== 'string') return;
 									
 									if (value.match(/AKIA[A-Z0-9]{16}/)) {
+										stats.matchesFound++;
 										matches.push({
 											pattern: 'AWS Access Key',
 											path: path,
@@ -704,6 +874,7 @@ func main() {
 									}
 									
 									if (value.match(/secret[a-zA-Z0-9]{40}/)) {
+										stats.matchesFound++;
 										matches.push({
 											pattern: 'AWS Secret Key',
 											path: path,
@@ -714,6 +885,7 @@ func main() {
 									}
 									
 									if (value.match(/-----BEGIN (?:RSA|OPENSSH|DSA|EC|PGP) PRIVATE KEY-----/)) {
+										stats.matchesFound++;
 										matches.push({
 											pattern: 'Private Key',
 											path: path,
@@ -724,6 +896,7 @@ func main() {
 									}
 									
 									if (value.match(/eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*$/)) {
+										stats.matchesFound++;
 										matches.push({
 											pattern: 'JWT Token',
 											path: path,
@@ -743,6 +916,7 @@ func main() {
 									if (ignoredPaths.includes(path.split('.').pop())) return;
 									
 									visited.add(obj);
+									stats.objectsScanned++;
 									
 									try {
 										for (const prop in obj) {
@@ -770,23 +944,26 @@ func main() {
 								// Start scanning from global object
 								scanObject(globalObject);
 								
-								return JSON.stringify(matches);
+								return JSON.stringify({
+									matches: matches,
+									stats: stats
+								});
 							} catch (e) {
 								return JSON.stringify({ error: e.message });
 							}
 						})()
 					`, &result).Do(ctx)
-					
+
 					if err != nil {
 						continue
 					}
-					
-					if err := json.Unmarshal([]byte(result), &matches); err != nil {
+
+					if err := json.Unmarshal([]byte(result), &response); err != nil {
 						continue
 					}
-					
+
 					// Print only new matches
-					for _, match := range matches {
+					for _, match := range response.Matches {
 						// Create a unique key for this secret
 						secretKey := match.Path + ":" + match.Value
 						if !seenSecrets[secretKey] {
@@ -794,7 +971,21 @@ func main() {
 							printTableRow(os.Stdout, match.Pattern, match.Path, match.Value, match.Description)
 						}
 					}
+
+					// Update final stats
+					finalStats = response.Stats
+
 				case <-ctx.Done():
+					// Clear the spinner before showing stats
+					clearSpinner()
+
+					// Print final stats before exiting
+					fmt.Println("\n┌" + strings.Repeat("─", 50) + "┐")
+					fmt.Println("│ \033[1mMonitoring Statistics\033[0m" + strings.Repeat(" ", 28) + "│")
+					fmt.Println("├" + strings.Repeat("─", 50) + "┤")
+					fmt.Printf("│ Total Objects Scanned: %-25d │\n", finalStats.ObjectsScanned)
+					fmt.Printf("│ Total Matches Found:   %-25d │\n", finalStats.MatchesFound)
+					fmt.Println("└" + strings.Repeat("─", 50) + "┘")
 					return nil
 				}
 			}
@@ -807,4 +998,4 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-} 
+}
